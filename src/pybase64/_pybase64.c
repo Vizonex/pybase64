@@ -24,6 +24,8 @@ typedef struct pybase64_state {
     uint32_t active_simd_flag;
     uint32_t simd_flags;
     int libbase64_simd_flag;
+    PyTypeObject* EncoderType;
+
 } pybase64_state;
 
 #if defined(PY_VERSION_HEX) && PY_VERSION_HEX >= 0x030d0000
@@ -970,6 +972,160 @@ static void _pybase64_free(void *m)
 {
     _pybase64_clear((PyObject *)m);
 }
+
+
+// I just find writing struct everytime to be rather annoying - Vizonex
+typedef struct base64_state base64_state_t;
+
+/* === Encoder Stream === */
+typedef struct _py_encoder_object {
+    PyObject_HEAD
+    /* C Structure */
+    base64_state_t state;
+    /* buffer itself */
+    char* buf;
+    /* buffer's position */
+    size_t pos;
+    /* allocated size */
+    size_t size;
+    /* chosen or grabbed flags */
+    uint32_t flags;
+    char alphabet[2];
+    int use_alphabet;
+} PyEncoderObject;
+
+#define PyEncoderObject_RECAST(OBJ) (PyEncoderObject*)(OBJ)
+
+// This is (sort of) my first time writing my own 
+// CPython-like object by myself, my only other contributing to CPython-like projects was fixing multidict's memory leak 
+// so please be paitient with me :))
+// I'll get rid of all my comments & any leftover debug artifacts when I am finished...
+
+
+/* Might be reused a couple times so better put this into a function */
+
+/* === INTERNAL === */
+
+/* used for resetting or initalizing a state */
+static void encoder_object_stream_encode_init(PyEncoderObject* self){
+    base64_stream_encode_init(
+        &self->state,
+        (int)(self->flags)
+    );
+}
+
+
+/* === PUBLIC === */
+static int encoder_object_tp_init(PyEncoderObject* self, PyObject* args, PyObject* kwargs){
+    uint32_t flags = 0u;
+    /* an initial amount of memory to hand over for use elsewhere... */
+    size_t size = 1024;
+    PyObject* altchars = NULL;
+    static char *kwlist[] = {"size", "flags", "altchars"}; 
+    
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "|KIO", kwlist, &size, &flags, &altchars)){
+        return -1;
+    }
+
+    /* Parse this before handling memory, it's less annoying in this order... */
+    if (parse_alphabet(altchars, &self->alphabet, &self->use_alphabet) < 0){
+        return -1;
+    };
+
+    self->buf = (char*)PyMem_Malloc(size * sizeof(char));
+    if (self->buf == NULL){
+        PyErr_NoMemory();
+        return -1;
+    }
+    self->size = size;
+    self->pos = 0;
+    /* gets the flags we need for setting up the encoder the 
+    flags should also be a readonly property */
+    self->flags = (flags) ? flags : pybase64_get_simd_flags();
+
+    /* initalize self->state */
+    encoder_object_stream_encode_init(self);
+    return 0;
+}
+
+/* Encodes a single object returns NULL if or when something fails... */
+static PyObject* encoder_object_encode(PyEncoderObject* self, PyObject* obj){
+    Py_buffer buffer;
+
+    if (get_buffer(obj, &buffer) != 0){
+        return NULL;
+    }
+    
+    if (buffer.len > (3 * (PY_SSIZE_T_MAX / 4))) {
+        PyBuffer_Release(&buffer);
+        PyErr_NoMemory();
+        return NULL;
+    }
+
+    out_len = (size_t)(((buffer.len + 2) / 3) * 4);
+    size_t new_pos = out_len + self->pos;
+
+    /* Do we need to reallocate memory? */
+    if (new_pos > self->size){
+    
+        /* IDK of a good realloc size yet but a good idea is the current-size + the new position */
+        char* buf = (char*)PyMem_Realloc(self->buf, self->size + new_pos);
+        if (buf == NULL){
+            PyBuffer_Release(&buffer);
+            PyErr_NoMemory();
+            return NULL;
+        }
+        self->buf = buf;
+        self->size += new_pos;
+    }
+    
+
+
+    Py_BEGIN_ALLOW_THREADS
+    /* Might be faster to transform this into a C-Styled Callback */
+    if (self->use_alphabet){
+        size_t pos;
+        base64_stream_encode(self->state, (const char*)buffer.buf, buffer.len, self->buf + self->pos, &pos);
+        translate_inplace(self->buf + self->pos, pos, self->alphabet);
+        self->pos = pos;
+    } else {
+        /* we can be alot more optimized here since wrapping &pos does the job */
+        base64_stream_encode(self->state, (const char*)buffer.buf, buffer.len, self->buf + self->pos, &self->pos);
+    }
+    Py_END_ALLOW_THREADS;
+    PyBuffer_Release(&buffer);
+    Py_RETURN_NONE;
+}
+
+/* Finallizes Base64 output for either unicode, bytes or bytearray */
+static void encoder_object_finish_impl(PyEncoderObject* self){
+    Py_BEGIN_ALLOW_THREADS
+    int const libbase64_simd_flag = (int)self->flags;
+    base64_stream_encode_final(self->state, self->buf + self->pos, &self->pos);
+    Py_END_ALLOW_THREADS;
+}
+
+/* Resets encoder after finishing the object... */
+static PyObject* encoder_object_finish_as_bytes(PyEncoderObject* self){
+    if (self->pos == 0){
+        /* EMPTY */
+        return PyBytes_FromStringAndSize(NULL, 0);
+    }
+
+    PyObject* bytes = PyBytes_FromStringAndSize(self->buf, self->pos);
+    if (bytes == NULL){
+        /* do not reset if failure occurs */
+        return NULL;
+    }
+    /* Safe to reset encoder for another run... */
+    encoder_object_stream_encode_init(self);
+    self->pos = 0;
+    return bytes;
+}
+
+
+
+
 
 static PyMethodDef _pybase64_methods[] = {
     { "b64encode", (PyCFunction)pybase64_encode, METH_VARARGS | METH_KEYWORDS, NULL },
